@@ -26,6 +26,22 @@ func poolCreditError() customStatusError {
 	return customStatusError{code: http.StatusBadRequest, msg: poolTestCreditBody}
 }
 
+func TestPoolBillingErrorsAreNotInvalidRequests(t *testing.T) {
+	for _, code := range []string{"billing_hard_limit_reached", "insufficient_balance", "insufficient_credits"} {
+		err := customStatusError{code: http.StatusBadRequest, msg: `{"error":{"code":"` + code + `","message":"Billing limit reached"}}`}
+		if !IsInsufficientCreditsError(err) {
+			t.Fatalf("%s was not recognized as a credit error", code)
+		}
+		if isRequestInvalidError(err) {
+			t.Errorf("%s incorrectly stops credential failover", code)
+		}
+	}
+	err := customStatusError{code: http.StatusBadRequest, msg: `{"error":{"type":"invalid_request_error","message":"Malformed request"}}`}
+	if !isRequestInvalidError(err) {
+		t.Fatal("ordinary invalid requests must still stop credential failover")
+	}
+}
+
 // memoryPoolHealthStore is an in-memory PoolHealthStore that survives manager restarts.
 type memoryPoolHealthStore struct {
 	mu    sync.Mutex

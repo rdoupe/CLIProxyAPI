@@ -183,6 +183,42 @@ func TestPoolPolicyHandlerPersistsConfig(t *testing.T) {
 	}
 }
 
+func TestPoolPolicyHandlerRestoresDefaultsAcrossReload(t *testing.T) {
+	h, manager, _ := newPoolHandlerFixture(t)
+	for _, body := range []string{
+		`{"strategy":"subscriptions_first","allowPaidFallback":false}`,
+		`{"strategy":"existing","allowPaidFallback":true}`,
+	} {
+		rec := servePool(h.PutPoolPolicy, http.MethodPut, "/v8/management/pool/policy", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("put policy = %d %s", rec.Code, rec.Body.String())
+		}
+		loaded, err := config.LoadConfig(h.configFilePath)
+		if err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		if got, want := coreauth.PoolPolicyFromConfig(loaded), manager.PoolPolicy(); got != want {
+			t.Fatalf("saved policy = %+v, runtime policy = %+v", got, want)
+		}
+	}
+}
+
+func TestPoolPolicyHandlerRollsBackFailedSave(t *testing.T) {
+	h, manager, _ := newPoolHandlerFixture(t)
+	h.configFilePath = t.TempDir() // A directory cannot be replaced with a config file.
+	before := coreauth.PoolPolicyFromConfig(h.cfg)
+	rec := servePool(h.PutPoolPolicy, http.MethodPut, "/v8/management/pool/policy", `{"strategy":"subscriptions_first","allowPaidFallback":false}`)
+	if rec.Code < http.StatusInternalServerError {
+		t.Fatalf("expected save error, got %d %s", rec.Code, rec.Body.String())
+	}
+	if got := coreauth.PoolPolicyFromConfig(h.cfg); got != before {
+		t.Fatalf("failed save changed config: got %+v, want %+v", got, before)
+	}
+	if got := manager.PoolPolicy(); got != before {
+		t.Fatalf("failed save changed runtime: got %+v, want %+v", got, before)
+	}
+}
+
 // poolNoopExecutor registers the claude provider without ever contacting it.
 type poolNoopExecutor struct{}
 

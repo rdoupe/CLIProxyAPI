@@ -229,18 +229,17 @@ func (h *Handler) PutPoolPolicy(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	previous := h.cfg.Routing.Pool
 	if policy.Strategy == coreauth.PoolStrategySubscriptionsFirst {
 		h.cfg.Routing.Pool.Strategy = "subscriptions-first"
 	} else {
-		h.cfg.Routing.Pool.Strategy = ""
+		h.cfg.Routing.Pool.Strategy = "existing"
 	}
-	if policy.AllowPaidFallback {
-		h.cfg.Routing.Pool.AllowPaidFallback = nil
-	} else {
-		allow := false
-		h.cfg.Routing.Pool.AllowPaidFallback = &allow
-	}
+	allow := policy.AllowPaidFallback
+	h.cfg.Routing.Pool.AllowPaidFallback = &allow
 	if h.persistLocked(c) {
 		manager.SetPoolPolicy(policy)
+	} else {
+		h.cfg.Routing.Pool = previous
 	}
 }

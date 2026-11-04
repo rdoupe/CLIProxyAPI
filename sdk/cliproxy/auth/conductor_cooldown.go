@@ -2989,7 +2989,7 @@ func isRequestInvalidError(err error) bool {
 	if isInvalidGrantError(err) {
 		return false
 	}
-	if isCreditBalanceTooLowError(err) {
+	if IsInsufficientCreditsError(err) {
 		return false
 	}
 	if isModelSupportError(err) {
