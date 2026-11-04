@@ -60,6 +60,13 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/oauth/status", s.mgmt.GetAuthStatus)
 	v8.DELETE("/oauth/session", s.mgmt.CancelAuthSession)
 
+	v8.GET("/pool/overview", s.mgmt.GetPoolOverview)
+	v8.GET("/pool/stats", s.mgmt.GetPoolStats)
+	v8.GET("/pool/explain", s.mgmt.GetPoolExplain)
+	v8.GET("/pool/policy", s.mgmt.GetPoolPolicy)
+	v8.PUT("/pool/policy", s.mgmt.PutPoolPolicy)
+	v8.POST("/pool/accounts/:id/reset", s.mgmt.ResetPoolAccount)
+
 	v8.GET("/plugins", s.mgmt.ListPlugins)
 	v8.DELETE("/plugins/:id", s.mgmt.DeletePlugin)
 	v8.GET("/plugins/store", s.mgmt.ListPluginStore)

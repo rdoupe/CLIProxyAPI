@@ -547,6 +547,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
+			if !homeMode {
+				errPick = m.poolPickError(providers, routeModel, errPick)
+			}
 			return cliproxyexecutor.Response{}, errPick
 		}
 
@@ -567,6 +570,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
+		}
+		if len(attempted) > 0 {
+			m.notePoolFailover(provider, routeModel, auth)
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
@@ -765,6 +771,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
 			}
+			if !homeMode {
+				errPick = m.poolPickError(providers, routeModel, errPick)
+			}
 			return cliproxyexecutor.Response{}, errPick
 		}
 
@@ -785,6 +794,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
+		}
+		if len(attempted) > 0 {
+			m.notePoolFailover(provider, routeModel, auth)
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
@@ -1022,6 +1034,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, preferredErr
 			}
+			if !homeMode {
+				errPick = m.poolPickError(providers, routeModel, errPick)
+			}
 			return nil, errPick
 		}
 		if auth == nil || executor == nil {
@@ -1127,6 +1142,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 			}
 			continue
+		}
+		if len(attempted) > 0 {
+			m.notePoolFailover(provider, routeModel, auth)
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error

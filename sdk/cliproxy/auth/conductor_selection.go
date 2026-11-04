@@ -118,6 +118,9 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
+	if auth.pool.paidExcluded {
+		return false
+	}
 	if e.requiredKind != "" && auth.AuthKind() != e.requiredKind {
 		return false
 	}

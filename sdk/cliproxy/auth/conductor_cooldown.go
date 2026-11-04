@@ -173,6 +173,7 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
+	m.applyPoolPolicyFromConfig(cfg)
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -906,6 +907,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
+	poolBlockChanged, poolSave := false, false
 	now := time.Now()
 	// A 401 condemns the access token, except one a -and-cooldown rule matched: that only cools the credential.
 	rejectsToken := !result.Success && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) && !shouldSkipCredentialCooldown(result.Error) && (statusCodeFromResult(result.Error) == http.StatusUnauthorized || isUnauthorizedError(result.Error))
@@ -1360,6 +1362,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			scheduleUnauthorizedRefresh = true
 		}
 
+		poolBlockChanged, poolSave = m.applyPoolResultLocked(auth, result, now)
+
 		auth.Generation++
 		auth.UpdatedAt = now
 
@@ -1379,8 +1383,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	releaseMutation()
+	if poolSave {
+		m.poolTracker().requestSave()
+	}
 	if m.scheduler != nil && authSnapshot != nil {
-		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh
+		// A credit block applies to every model, so refresh all shards.
+		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh || poolBlockChanged
 		var targetModels []string
 		if !credentialScopedResult && modelKey != "" {
 			targetModels = append(targetModels, modelKey)

@@ -561,6 +561,25 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// Pool configures account-pool ordering between subscriptions and API keys.
+	// The zero value keeps the existing priority-only behavior.
+	Pool RoutingPoolConfig `yaml:"pool,omitempty" json:"pool,omitempty"`
+}
+
+// RoutingPoolConfig configures the account-pool policy.
+type RoutingPoolConfig struct {
+	// Strategy selects how subscriptions and API keys are ordered.
+	// Supported values:
+	//   - "existing" (default): order by configured priority only.
+	//   - "subscriptions-first": every login-based subscription is tried before any API key;
+	//     configured priority still orders accounts within each group.
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// AllowPaidFallback controls whether API-key accounts may be selected at all.
+	// Default: true. When false, API keys are never used, so providers reachable only
+	// through API keys have no eligible account.
+	AllowPaidFallback *bool `yaml:"allow-paid-fallback,omitempty" json:"allow-paid-fallback,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

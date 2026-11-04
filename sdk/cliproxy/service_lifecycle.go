@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/poolstats"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
@@ -57,6 +58,10 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startModelCatalogUpdaters(ctx)
 
 	usage.StartDefault(ctx)
+	poolStats := poolstats.Register()
+	if s.coreManager != nil {
+		s.coreManager.SetPoolEventSink(poolStats)
+	}
 	cfg := s.currentConfig()
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {
@@ -96,6 +101,9 @@ func (s *Service) Run(ctx context.Context) error {
 			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
+		}
+		if errRestorePool := s.coreManager.RestorePoolHealth(ctx); errRestorePool != nil {
+			log.Warnf("failed to restore account pool health: %v", errRestorePool)
 		}
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 			includeBaseline: true,
@@ -392,6 +400,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.coreManager != nil {
+			if errFlushPool := s.coreManager.FlushPoolHealth(ctx); errFlushPool != nil {
+				log.Warnf("failed to persist account pool health: %v", errFlushPool)
+			}
+		}
+		if errFlushStats := poolstats.Default().Flush(ctx); errFlushStats != nil {
+			log.Warnf("failed to persist account pool statistics: %v", errFlushStats)
+		}
 		if errShutdownKV := s.shutdownKVStore(); errShutdownKV != nil {
 			log.Errorf("failed to stop local kv store: %v", errShutdownKV)
 			if shutdownErr == nil {
