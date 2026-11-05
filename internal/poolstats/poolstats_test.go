@@ -230,3 +230,16 @@ func TestParseRange(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectorMemoryStoreNeverPersists(t *testing.T) {
+	collector := NewCollector(nil, nil)
+	collector.SetStore(MemoryStore{})
+	collector.HandleUsage(context.Background(), coreusage.Record{Provider: "claude", Model: "m", AuthIndex: "a"})
+	if err := collector.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	report := collector.Query(context.Background(), time.Hour)
+	if report.Persistence != "memory" || report.Totals.Requests != 1 {
+		t.Fatalf("report = %+v, want memory persistence with the request counted", report)
+	}
+}

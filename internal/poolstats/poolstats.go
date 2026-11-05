@@ -67,6 +67,19 @@ func (KVStore) Persistence() string {
 	return "memory"
 }
 
+// MemoryStore keeps statistics in this process only (used in Home mode, where
+// the Home KV is shared by every node).
+type MemoryStore struct{}
+
+// Load implements Store.
+func (MemoryStore) Load(context.Context, string, *Bucket) (bool, error) { return false, nil }
+
+// Save implements Store.
+func (MemoryStore) Save(context.Context, string, *Bucket, time.Duration) error { return nil }
+
+// Persistence implements Store.
+func (MemoryStore) Persistence() string { return "memory" }
+
 // Counts are additive counters for one bucket and dimension value.
 type Counts struct {
 	Requests       int64 `json:"requests"`
@@ -171,6 +184,16 @@ func NewCollector(store Store, now func() time.Time) *Collector {
 	}
 	start := now()
 	return &Collector{store: store, now: now, buckets: map[int64]*Bucket{}, loaded: map[int64]bool{}, dirty: map[int64]bool{}, started: start, lastFlush: start}
+}
+
+// SetStore replaces the persistence backend.
+func (c *Collector) SetStore(store Store) {
+	if c == nil || store == nil {
+		return
+	}
+	c.mu.Lock()
+	c.store = store
+	c.mu.Unlock()
 }
 
 var (
@@ -390,10 +413,13 @@ func (c *Collector) ensureLoaded(ctx context.Context, from, to int64) {
 // buckets of a not-yet-loaded hour hold only this process's deltas (they are
 // never written before being loaded), so adding the persisted copy is exact.
 func (c *Collector) loadStarts(ctx context.Context, starts []int64) error {
+	c.mu.Lock()
+	store := c.store
+	c.mu.Unlock()
 	var firstErr error
 	for _, start := range starts {
 		var persisted Bucket
-		found, err := c.store.Load(ctx, bucketKey(start), &persisted)
+		found, err := store.Load(ctx, bucketKey(start), &persisted)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

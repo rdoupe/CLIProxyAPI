@@ -635,6 +635,8 @@ type Manager struct {
 	cond   *sync.Cond
 	queue  []queueItem
 	closed bool
+	// done is closed when the dispatcher has delivered every queued record.
+	done chan struct{}
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -643,7 +645,7 @@ type Manager struct {
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
+	m := &Manager{done: make(chan struct{})}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -659,7 +661,10 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		var workerCtx context.Context
 		workerCtx, m.cancel = context.WithCancel(ctx)
-		go m.run(workerCtx)
+		go func() {
+			defer close(m.done)
+			m.run(workerCtx)
+		}()
 	})
 }
 
@@ -677,6 +682,30 @@ func (m *Manager) Stop() {
 		m.mu.Unlock()
 		m.cond.Broadcast()
 	})
+}
+
+// StopAndDrain stops the dispatcher and waits until every record queued
+// before the stop has been delivered to the plugins, or until ctx ends.
+func (m *Manager) StopAndDrain(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	// Starting here is a no-op for a running dispatcher; for one never
+	// started it lets done close once the (empty) queue is drained.
+	m.Start(context.Background())
+	m.Stop()
+	if m.done == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-m.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Register appends a plugin to the delivery list.
@@ -829,3 +858,6 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }
+
+// StopAndDrainDefault stops the default manager and waits for queued records.
+func StopAndDrainDefault(ctx context.Context) error { return DefaultManager().StopAndDrain(ctx) }

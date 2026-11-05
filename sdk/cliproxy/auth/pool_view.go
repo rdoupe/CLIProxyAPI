@@ -15,6 +15,8 @@ import (
 // PoolSchemaVersion is the schema version of the pool health API.
 const PoolSchemaVersion = 1
 
+const poolPaidExcludedReason = "Not used: paid fallback is disabled by policy"
+
 // PoolBalance is a provider-reported balance. The pool never estimates one, so
 // accounts without a provider-reported balance carry a nil *PoolBalance.
 type PoolBalance struct {
@@ -24,12 +26,14 @@ type PoolBalance struct {
 
 // PoolAccount is the sanitized health view of one credential.
 type PoolAccount struct {
-	ID            string       `json:"id"`
-	Provider      string       `json:"provider"`
-	Label         string       `json:"label"`
-	Kind          string       `json:"kind"`
-	State         string       `json:"state"`
-	Reason        string       `json:"reason"`
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Label    string `json:"label"`
+	Kind     string `json:"kind"`
+	State    string `json:"state"`
+	Reason   string `json:"reason"`
+	// HealthReason explains State alone, without any policy note in Reason.
+	HealthReason  string       `json:"healthReason"`
 	Eligible      bool         `json:"eligible"`
 	Priority      int          `json:"priority"`
 	ResetAt       *time.Time   `json:"resetAt"`
@@ -45,6 +49,9 @@ type PoolOverview struct {
 	Accounts      []PoolAccount `json:"accounts"`
 	Policy        PoolPolicy    `json:"policy"`
 	Persistence   string        `json:"persistence"`
+	// HomeMode is true when the Home control plane, not this node's pool
+	// policy, chooses accounts; health and stats are then memory-only.
+	HomeMode bool `json:"homeMode"`
 }
 
 // PoolRouteCandidate is one credential considered by ExplainPoolRoute.
@@ -67,7 +74,11 @@ type PoolRouteExplanation struct {
 	Tied              []string             `json:"tiedAccountIds"`
 	Candidates        []PoolRouteCandidate `json:"candidates"`
 	Reason            string               `json:"reason"`
+	// Note states what the model-only explanation does not evaluate.
+	Note string `json:"note"`
 }
+
+const poolExplainNote = "Model-level view only: per-request filters (a required credential kind or credential policy, a pinned account, accounts already tried by the request, session affinity, plugin schedulers, model aliases and per-account model limits) and in-flight rotation state can change which account a real request uses."
 
 // PoolLabelForAuth returns a display label that never contains credential material.
 func PoolLabelForAuth(auth *Auth) string {
@@ -137,6 +148,9 @@ func poolAccountHealth(auth *Auth, rec *PoolHealthRecord, now time.Time) (state,
 	if rec.blocked() {
 		if rec.RecheckAt.After(now) {
 			return PoolStateOutOfCredits, rec.Reason + "; it is skipped for every model until the automatic recheck", false, rec.RecheckAt
+		}
+		if rec.probing(now) {
+			return PoolStateOutOfCredits, "Recheck in progress: one request is testing whether credit was added", false, time.Time{}
 		}
 		return PoolStateOutOfCredits, "Recheck due: the next request will test whether credit was added", true, time.Time{}
 	}
@@ -214,6 +228,7 @@ func (m *Manager) PoolOverview(now time.Time) PoolOverview {
 	if m == nil {
 		return overview
 	}
+	overview.HomeMode = m.HomeEnabled()
 	m.mu.RLock()
 	auths := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
@@ -249,24 +264,29 @@ func (m *Manager) poolAccountFor(auth *Auth, now time.Time) PoolAccount {
 	if hasRecord {
 		recPtr = &rec
 	}
-	state, reason, eligible, resetAt := poolAccountHealth(auth, recPtr, now)
+	state, healthReason, eligible, resetAt := poolAccountHealth(auth, recPtr, now)
+	if state == PoolStateReady && (!hasRecord || rec.LastSuccessAt.IsZero()) {
+		healthReason = "Ready (no successful request observed yet)"
+	}
+	reason := healthReason
 	if auth.pool.paidExcluded {
 		eligible = false
-		reason = "Not used: paid fallback is disabled by policy"
+		reason = poolPaidExcludedReason
 		if state != PoolStateReady && state != PoolStateUnknown {
-			reason = "Not used: paid fallback is disabled by policy; " + reason
+			reason = poolPaidExcludedReason + "; " + healthReason
 		}
 	}
 	account := PoolAccount{
-		ID:       auth.Index,
-		Provider: strings.ToLower(strings.TrimSpace(auth.Provider)),
-		Label:    PoolLabelForAuth(auth),
-		Kind:     PoolKindForAuth(auth),
-		State:    state,
-		Reason:   reason,
-		Eligible: eligible,
-		Priority: authConfiguredPriority(auth),
-		ResetAt:  timePtr(resetAt),
+		ID:           auth.Index,
+		Provider:     strings.ToLower(strings.TrimSpace(auth.Provider)),
+		Label:        PoolLabelForAuth(auth),
+		Kind:         PoolKindForAuth(auth),
+		State:        state,
+		Reason:       reason,
+		HealthReason: healthReason,
+		Eligible:     eligible,
+		Priority:     authConfiguredPriority(auth),
+		ResetAt:      timePtr(resetAt),
 	}
 	if hasRecord {
 		account.LastSuccessAt = timePtr(rec.LastSuccessAt)
@@ -279,7 +299,7 @@ func (m *Manager) poolAccountFor(auth *Auth, now time.Time) PoolAccount {
 // selection state, which account a request for model would use next.
 func (m *Manager) ExplainPoolRoute(model string, now time.Time) PoolRouteExplanation {
 	model = strings.TrimSpace(model)
-	explanation := PoolRouteExplanation{Model: model, Policy: m.PoolPolicy(), Tied: []string{}, Candidates: []PoolRouteCandidate{}}
+	explanation := PoolRouteExplanation{Model: model, Policy: m.PoolPolicy(), Tied: []string{}, Candidates: []PoolRouteCandidate{}, Note: poolExplainNote}
 	if m == nil || model == "" {
 		explanation.Reason = "No model given"
 		return explanation
@@ -326,7 +346,7 @@ func (m *Manager) ExplainPoolRoute(model string, now time.Time) PoolRouteExplana
 	}
 	strategy := "round-robin"
 	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && strings.TrimSpace(cfg.Routing.Strategy) != "" {
-		strategy = strings.TrimSpace(cfg.Routing.Strategy)
+		strategy = strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
 	}
 	affinityNote := ""
 	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.Routing.SessionAffinity {
@@ -335,11 +355,24 @@ func (m *Manager) ExplainPoolRoute(model string, now time.Time) PoolRouteExplana
 	if len(explanation.Tied) == 1 {
 		id := explanation.Tied[0]
 		explanation.SelectedAccountID = &id
-		explanation.Reason = fmt.Sprintf("%s is the only eligible account at the top of the order.%s", candidates[0].Label, affinityNote)
+		explanation.Reason = fmt.Sprintf("%s is the only eligible account at the top of the order, so it is tried first.%s", candidates[0].Label, affinityNote)
 		return explanation
 	}
-	explanation.Reason = fmt.Sprintf("%d eligible accounts share the top of the order; the %s strategy rotates between them.%s", len(explanation.Tied), strategy, affinityNote)
+	explanation.Reason = fmt.Sprintf("%d eligible accounts share the top of the order; %s%s", len(explanation.Tied), poolTieBehavior(strategy), affinityNote)
 	return explanation
+}
+
+// poolTieBehavior describes how the routing strategy picks among tied accounts.
+func poolTieBehavior(strategy string) string {
+	switch strategy {
+	case "fill-first", "fillfirst", "ff":
+		return "the fill-first strategy keeps using one of them until it becomes unavailable."
+	case "round-robin", "roundrobin", "rr", "":
+		return "the round-robin strategy rotates between them."
+	case "weighted-round-robin":
+		return "the weighted-round-robin strategy spreads requests between them by weight."
+	}
+	return fmt.Sprintf("the %s strategy chooses among them.", strategy)
 }
 
 func (m *Manager) poolRouteCandidate(auth *Auth, hasExecutor, blocked bool, next time.Time, now time.Time) PoolRouteCandidate {
@@ -356,7 +389,7 @@ func (m *Manager) poolRouteCandidate(auth *Auth, hasExecutor, blocked bool, next
 	case !hasExecutor:
 		candidate.Reason = "No executor is registered for this provider"
 	case auth.pool.paidExcluded:
-		candidate.Reason = "Not used: paid fallback is disabled by policy"
+		candidate.Reason = account.Reason
 	case blocked && account.State != PoolStateReady:
 		candidate.Reason = account.Reason
 	case blocked && !next.IsZero():

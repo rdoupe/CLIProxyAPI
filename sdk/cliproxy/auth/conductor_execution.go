@@ -528,7 +528,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	attempted := make(map[string]struct{})
 	var lastErr error
 	var upstreamErr error
+	// probe is this request's reservation of a due out-of-credits recheck.
+	var probe *poolProbe
+	defer func() { probe.release() }()
 	for {
+		probe.release()
+		probe = nil
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -551,6 +556,15 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				errPick = m.poolPickError(providers, routeModel, errPick)
 			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+		if !homeMode {
+			admitted, ok := m.admitPoolPick(auth)
+			if !ok {
+				// Another request is already rechecking this out-of-credits account.
+				tried[auth.ID] = struct{}{}
+				continue
+			}
+			probe = admitted
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -986,7 +1000,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var lastErr error
 	var upstreamErr error
 	var roundTiming homeRetryRoundTiming
+	// probe is this request's reservation of a due out-of-credits recheck. A
+	// started stream hands it to the stream wrapper, which releases it once
+	// the stream's result is recorded.
+	var probe *poolProbe
+	defer func() { probe.release() }()
 	for {
+		probe.release()
+		probe = nil
 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
 			if lastErr != nil {
@@ -1038,6 +1059,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				errPick = m.poolPickError(providers, routeModel, errPick)
 			}
 			return nil, errPick
+		}
+		if !homeMode && auth != nil {
+			admitted, ok := m.admitPoolPick(auth)
+			if !ok {
+				// Another request is already rechecking this out-of-credits account.
+				tried[auth.ID] = struct{}{}
+				continue
+			}
+			probe = admitted
 		}
 		if auth == nil || executor == nil {
 			if selection != nil {
@@ -1241,6 +1271,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
+		execCtx = withPoolProbe(execCtx, probe)
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
 			if hasUpstreamExecutionAttempt(errStream) {
@@ -1298,6 +1329,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return wrapHomeStream(ctx, streamResult, selection, releaseAttempt), nil
 		}
+		probe = nil
 		return streamResult, nil
 	}
 }

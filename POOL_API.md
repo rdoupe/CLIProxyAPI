@@ -21,18 +21,21 @@ balance, a cost, a token count or a latency it did not observe.
 
 | `state`          | Meaning                                                                 | `eligible` | `resetAt`                     |
 |------------------|-------------------------------------------------------------------------|------------|-------------------------------|
-| `ready`          | Healthy.                                                                | true       | null                          |
+| `ready`          | Nothing is blocking it. This means eligible, **not** provider-verified: a never-used account is also `ready` (its `reason` then says no successful request was observed yet; check `lastSuccessAt`). | true       | null                          |
 | `paused`         | Turned off by an operator (disabled).                                   | false      | null                          |
 | `rate_limited`   | Usage limit reached. Account-wide: not eligible. Only some models: still eligible, `reason` says how many. | false / true | when the limit lifts (if known) |
-| `out_of_credits` | Provider said the account has no credit left (e.g. Anthropic `400 Your credit balance is too low`). Skipped for **every** model. | false until the recheck is due, then true | time of the automatic recheck; null once due |
+| `out_of_credits` | Provider said the account has no credit left (e.g. Anthropic `400 Your credit balance is too low`). Skipped for **every** model. | false until the recheck is due, then true; false again while one request is running the recheck | time of the automatic recheck; null once due |
 | `login_expired`  | Sign-in expired or was revoked; needs a new sign-in.                    | false      | null                          |
 | `unavailable`    | Cooling down after upstream errors (5xx, 403, …).                      | false / true (model-only) | when the cooldown ends |
 | `unknown`        | Not verified yet.                                                       | true       | null                          |
 
 `eligible` also becomes `false` when policy forbids the account
 (`allowPaidFallback: false` on an API key); `reason` then starts with
-`"Not used: paid fallback is disabled by policy"`. `reason` is always a short
-human-readable sentence safe to show as is.
+`"Not used: paid fallback is disabled by policy"`, followed by `"; "` and the
+health reason when the account is also unhealthy. `state` always describes
+health only, and `healthReason` is the health sentence without any policy
+note. `reason` and `healthReason` are short human-readable sentences safe to
+show as is.
 
 `balance` is always `null` in this release (no provider balance source is
 wired into the proxy). The UI must show "unknown", not zero.
@@ -44,6 +47,7 @@ wired into the proxy). The UI must show "unknown", not zero.
   "schemaVersion": 1,
   "observedAt": "2026-11-04T23:20:00Z",
   "persistence": "kv",                 // where account health survives restarts: "kv" | "memory"
+  "homeMode": false,                   // true: Home chooses accounts; health/stats are memory-only
   "accounts": [
     {
       "id": "a27dc58ccbb807a5",
@@ -52,6 +56,7 @@ wired into the proxy). The UI must show "unknown", not zero.
       "kind": "subscription",          // "subscription" | "api_key"
       "state": "ready",
       "reason": "Ready",
+      "healthReason": "Ready",         // health only, never a policy note
       "eligible": true,
       "priority": 0,                   // configured priority (higher is tried first)
       "resetAt": null,
@@ -135,16 +140,25 @@ Read-only: no provider is contacted and no rotation state moves. Missing
       "reason": "Provider reported the account has no credit left (HTTP 400); it is skipped for every model until the automatic recheck",
       "priority": 1, "effectivePriority": 1 }
   ],
-  "reason": "owner@example.com is the only eligible account at the top of the order."
+  "reason": "owner@example.com is the only eligible account at the top of the order, so it is tried first.",
+  "note": "Model-level view only: per-request filters (…) can change which account a real request uses."
 }
 ```
 
 Candidates are the accounts registered for that exact model, eligible first,
-then by `effectivePriority`. When several eligible accounts tie, the configured
-`routing.strategy` (round-robin by default) rotates between them, so
-`selectedAccountId` is `null` and `tiedAccountIds` lists them. With session
+then by `effectivePriority`. When several eligible accounts tie,
+`selectedAccountId` is `null`, `tiedAccountIds` lists them and `reason` says
+how the configured `routing.strategy` picks among them (round-robin rotates,
+fill-first keeps using one until it becomes unavailable). With session
 affinity on, an established session may stay on another eligible account; the
 `reason` says so. The explanation never substitutes another model.
+
+This is a model-level explanation, not a promise about one request: it does
+not evaluate per-request filters (a required credential kind or credential
+policy, a pinned account, accounts the request already tried, session
+affinity bindings, plugin schedulers, model aliases, per-account model
+limits) or live rotation state. `note` repeats this for display.
+`selectedAccountId` means "tried first for a plain request for this model".
 
 ## GET /v8/management/pool/policy, PUT /v8/management/pool/policy
 
@@ -179,21 +193,42 @@ after a top-up). → `200 {"status":"ok","account":{…account object…}}`, or
 - **Detection.** Out-of-credits is recognised from Anthropic's
   `credit balance is too low` 400 and from explicit billing codes
   (`insufficient_quota`, `billing_hard_limit_reached`, `insufficient_balance`,
-  `credit_balance_too_low`, `insufficient_credits`).
+  `credit_balance_too_low`, `insufficient_credits`) in the top-level
+  `error.code`/`code`/`error.type`/`type` of the error body or in the
+  executor's typed error code. Codes count only on HTTP 400, 402, 403 or 429
+  (or when no status is known); a server error or a word inside request
+  content never does. Such billing 400s are not treated as bad requests: the
+  request fails over instead of being returned to the client.
 - **Failover.** The failing request moves to another account for the **same
   model** before any output reaches the client (including an error arriving as
   the first stream event). A stream that already sent output is never replayed.
 - **Account-wide block.** Once out of credits, the account is skipped for every
   model; session affinity cannot keep a session on it.
-- **Controlled recheck.** After 1 h the next request may probe the account; a
-  renewed credit error fails over invisibly and doubles the wait (1 h, 2 h,
-  4 h … max 24 h). A success clears the block and its per-model credit
-  cooldowns. Manual reset is the endpoint above.
+- **Controlled recheck.** After 1 h exactly one generation request reserves
+  the recheck and probes the account; concurrent requests skip it and use
+  other accounts. The reservation ends when the probe's result is recorded
+  (for a stream, when the stream ends), when the request fails for another
+  reason or is canceled (the recheck is then due again), or after 10 minutes
+  if the request never reports back. A renewed credit error fails over
+  invisibly and doubles the wait (1 h, 2 h, 4 h … max 24 h). Only a
+  successful generation clears the block and its per-model credit cooldowns:
+  token counting neither reserves the recheck nor clears or extends the block,
+  and results of requests dispatched before the block was recorded are
+  ignored. Requests that select an account outside the proxy's own request
+  loop (Home dispatch, direct `SelectAuth` callers) do not take the
+  reservation. Manual reset is the endpoint above.
+- **Disabled cooling.** `disable-cooling` (global, per provider or per
+  account) does not lift an out-of-credits block. This is deliberate: the
+  block is a funding state, not an error cooldown, and retrying an empty
+  account would fail every request until the recheck.
 - **All blocked.** When every account for the model is out of credits, clients
   get HTTP 402 with code `insufficient_credits` and the next recheck time.
-- **Persistence.** Health and statistics are stored in the configured KV store
-  (`server.kv-store`, on by default; Home KV in Home mode). With the KV store
-  disabled, `persistence` is `"memory"` and both reset on restart. Statistics
-  keep 30 days of hourly buckets.
-- **Home mode.** Health is recorded, but the Home dispatcher, not this policy,
-  chooses accounts.
+- **Persistence.** Health and statistics are stored in the local KV store
+  (`server.kv-store`, on by default). With the KV store disabled,
+  `persistence` is `"memory"` and both reset on restart. Statistics keep 30
+  days of hourly buckets.
+- **Home mode.** `homeMode` is `true`. The Home dispatcher, not this policy,
+  chooses accounts, and this node never writes pool health or statistics to
+  the Home KV (it is shared by every node, which would overwrite each other).
+  Both are memory-only for this node (`persistence: "memory"`) and reset on
+  restart. Cross-node pool health is not supported.

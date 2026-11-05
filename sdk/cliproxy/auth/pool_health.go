@@ -59,6 +59,8 @@ const (
 	poolMaxRecords       = 2048
 	poolTierStride       = 1_000_000_000
 	poolPriorityClampAbs = poolTierStride/2 - 1
+	// poolProbeTTL bounds a recheck reservation whose request never reports back.
+	poolProbeTTL = 10 * time.Minute
 )
 
 // PoolPolicy is the account-pool routing policy.
@@ -111,6 +113,24 @@ type PoolHealthRecord struct {
 	LastFailureAt time.Time `json:"lastFailureAt,omitzero"`
 	// seq is the execution watermark when the block was recorded; runtime only.
 	seq uint64
+	// probeToken and probeUntil reserve the due recheck for one generation
+	// request; runtime only, never persisted.
+	probeToken uint64
+	probeUntil time.Time
+}
+
+func (r *PoolHealthRecord) clearBlock() {
+	r.State, r.Reason, r.Since, r.RecheckAt, r.Strikes, r.seq = "", "", time.Time{}, time.Time{}, 0, 0
+	r.clearProbe()
+}
+
+func (r *PoolHealthRecord) clearProbe() {
+	r.probeToken, r.probeUntil = 0, time.Time{}
+}
+
+// probing reports whether a recheck reservation is active at now.
+func (r *PoolHealthRecord) probing(now time.Time) bool {
+	return r != nil && r.probeToken != 0 && r.probeUntil.After(now)
 }
 
 func (r *PoolHealthRecord) blocked() bool {
@@ -170,6 +190,22 @@ func (KVPoolHealthStore) PoolHealthPersistence() string {
 	return PoolPersistenceMemory
 }
 
+// MemoryPoolHealthStore keeps pool health in this process only. It is used in
+// Home mode, where the Home KV is shared by every node and this node's local
+// health must not overwrite the others'.
+type MemoryPoolHealthStore struct{}
+
+// LoadPoolHealth implements PoolHealthStore.
+func (MemoryPoolHealthStore) LoadPoolHealth(context.Context) (*PoolHealthSnapshot, error) {
+	return nil, nil
+}
+
+// SavePoolHealth implements PoolHealthStore.
+func (MemoryPoolHealthStore) SavePoolHealth(context.Context, *PoolHealthSnapshot) error { return nil }
+
+// PoolHealthPersistence implements PoolHealthStore.
+func (MemoryPoolHealthStore) PoolHealthPersistence() string { return PoolPersistenceMemory }
+
 // PoolEventSink receives pool routing events (used for request statistics).
 type PoolEventSink interface {
 	RecordFailover(provider, model, accountID string, at time.Time)
@@ -201,6 +237,8 @@ type poolTracker struct {
 	saveMu  sync.Mutex
 	saving  atomic.Bool
 	pending atomic.Bool
+
+	probeSeq uint64
 }
 
 func newPoolTracker() *poolTracker {
@@ -236,7 +274,11 @@ func PoolKindForAuth(auth *Auth) string {
 
 // IsInsufficientCreditsError reports whether err means the credential has no
 // prepaid credit or billing balance left. It covers the Anthropic
-// "credit balance is too low" 400 and explicit billing error codes.
+// "credit balance is too low" 400 and explicit billing error codes, read from
+// the typed Error.Code or from the top-level code/type fields of a JSON error
+// body. Billing codes count only on client-error statuses a provider uses for
+// billing (400, 402, 403, 429) or when no status is known; a code buried in
+// request content or a server error never does.
 func IsInsufficientCreditsError(err error) bool {
 	if err == nil {
 		return false
@@ -248,7 +290,7 @@ func IsInsufficientCreditsError(err error) bool {
 	if errors.As(err, &authErr) && authErr != nil {
 		return isInsufficientCreditsResultError(authErr)
 	}
-	return hasInsufficientCreditsCode(err.Error())
+	return poolBillingStatus(statusCodeFromError(err)) && hasInsufficientCreditsCode(err.Error())
 }
 
 func isInsufficientCreditsResultError(err *Error) bool {
@@ -258,7 +300,26 @@ func isInsufficientCreditsResultError(err *Error) bool {
 	if isCreditBalanceTooLowResultError(err) {
 		return true
 	}
-	return hasInsufficientCreditsCode(err.Message)
+	if !poolBillingStatus(statusCodeFromResult(err)) {
+		return false
+	}
+	return isInsufficientCreditsCode(err.Code) || hasInsufficientCreditsCode(err.Message)
+}
+
+func poolBillingStatus(status int) bool {
+	switch status {
+	case 0, http.StatusBadRequest, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	}
+	return false
+}
+
+func isInsufficientCreditsCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "insufficient_quota", "billing_hard_limit_reached", "insufficient_balance", "credit_balance_too_low", "insufficient_credits":
+		return true
+	}
+	return false
 }
 
 func hasInsufficientCreditsCode(body string) bool {
@@ -267,8 +328,7 @@ func hasInsufficientCreditsCode(body string) bool {
 		return false
 	}
 	for _, path := range []string{"error.code", "code", "error.type", "type", "response.error.code", "body.error.code"} {
-		switch strings.ToLower(strings.TrimSpace(ojson.Get(body, path).String())) {
-		case "insufficient_quota", "billing_hard_limit_reached", "insufficient_balance", "credit_balance_too_low", "insufficient_credits":
+		if isInsufficientCreditsCode(ojson.Get(body, path).String()) {
 			return true
 		}
 	}
@@ -369,6 +429,11 @@ func (t *poolTracker) stateForLocked(auth *Auth) poolAuthState {
 	if rec := t.records[poolHealthKey(auth.ID)]; rec.blocked() {
 		state.creditBlocked = true
 		state.recheckAt = rec.RecheckAt
+		// A reserved recheck keeps the account out of every other pick until
+		// the probe reports back or its reservation expires.
+		if rec.probeToken != 0 && rec.probeUntil.After(state.recheckAt) {
+			state.recheckAt = rec.probeUntil
+		}
 	}
 	kind := PoolKindForAuth(auth)
 	if t.policy.Strategy == PoolStrategySubscriptionsFirst {
@@ -428,32 +493,40 @@ func (m *Manager) applyPoolResultLocked(auth *Auth, result Result, now time.Time
 		rec = &PoolHealthRecord{}
 		t.records[key] = rec
 	}
+	// Only a generation dispatched after the block was recorded is evidence
+	// about the account's credit now. Token counting (SkipQuotaObservation) is
+	// free on most providers and proves nothing either way.
+	stale := result.ExecutionSeq != 0 && result.ExecutionSeq <= rec.seq
+	evidence := rec.blocked() && !stale && !result.SkipQuotaObservation
 	switch {
 	case result.Success:
 		rec.LastSuccessAt = now
-		// A success dispatched before the block proves nothing about credits.
-		if rec.blocked() && (result.ExecutionSeq == 0 || result.ExecutionSeq > rec.seq) {
-			rec.State, rec.Reason, rec.Since, rec.RecheckAt, rec.Strikes, rec.seq = "", "", time.Time{}, time.Time{}, 0, 0
+		if evidence {
+			rec.clearBlock()
 			blockChanged = true
 			clearCreditCooldownsLocked(auth, now)
 		}
 	case credits:
 		rec.LastFailureAt = now
-		// Failures of requests that were in flight while already blocked do not
-		// count as a new strike; only a failed recheck extends the backoff.
-		if !(rec.blocked() && rec.RecheckAt.After(now)) {
-			strikes := 1
-			since := now
-			if rec.blocked() {
-				strikes = rec.Strikes + 1
-				since = rec.Since
-			}
+		switch {
+		case !rec.blocked():
 			rec.State = PoolStateOutOfCredits
 			rec.Reason = poolCreditReason(statusCodeFromResult(result.Error))
-			rec.Since = since
-			rec.Strikes = strikes
-			rec.RecheckAt = now.Add(poolRecheckDelay(strikes))
+			rec.Since = now
+			rec.Strikes = 1
+			rec.RecheckAt = now.Add(poolRecheckDelay(1))
 			rec.seq = m.executionSeq.Load()
+			rec.clearProbe()
+			blockChanged = true
+		case evidence && !rec.RecheckAt.After(now):
+			// A failed recheck extends the backoff. Failures of requests that
+			// were in flight before the block, or that arrive before the
+			// recheck is due, are not new strikes.
+			rec.Strikes++
+			rec.Reason = poolCreditReason(statusCodeFromResult(result.Error))
+			rec.RecheckAt = now.Add(poolRecheckDelay(rec.Strikes))
+			rec.seq = m.executionSeq.Load()
+			rec.clearProbe()
 			blockChanged = true
 		}
 	default:
@@ -627,7 +700,7 @@ func (m *Manager) ResetPoolAccount(ctx context.Context, publicID string) (bool, 
 			authID = id
 			t.mu.Lock()
 			if rec := t.records[poolHealthKey(id)]; rec != nil {
-				rec.State, rec.Reason, rec.Since, rec.RecheckAt, rec.Strikes, rec.seq = "", "", time.Time{}, time.Time{}, 0, 0
+				rec.clearBlock()
 				t.dirty = true
 			}
 			t.mu.Unlock()
@@ -648,6 +721,108 @@ func (m *Manager) ResetPoolAccount(ctx context.Context, publicID string) (bool, 
 		return true, errReset
 	}
 	return true, t.flush(ctx)
+}
+
+// poolProbe is a reservation of an out-of-credits account's due recheck.
+// Releasing it is idempotent and never undoes a newer reservation.
+type poolProbe struct {
+	m      *Manager
+	authID string
+	token  uint64
+	once   sync.Once
+}
+
+func (p *poolProbe) release() {
+	if p == nil {
+		return
+	}
+	p.once.Do(func() { p.m.releasePoolProbe(p.authID, p.token) })
+}
+
+type poolProbeContextKey struct{}
+
+func withPoolProbe(ctx context.Context, probe *poolProbe) context.Context {
+	if probe == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, poolProbeContextKey{}, probe)
+}
+
+func poolProbeFromContext(ctx context.Context) *poolProbe {
+	if ctx == nil {
+		return nil
+	}
+	probe, _ := ctx.Value(poolProbeContextKey{}).(*poolProbe)
+	return probe
+}
+
+// admitPoolPick is called for every picked generation request before it is
+// dispatched. Healthy accounts are admitted without locking. For an
+// out-of-credits account whose recheck is due, exactly one request reserves
+// the recheck and is admitted with a probe it must release; every other
+// request is refused so it fails over to another account.
+func (m *Manager) admitPoolPick(auth *Auth) (*poolProbe, bool) {
+	if auth == nil || !auth.pool.creditBlocked {
+		return nil, true
+	}
+	t := m.poolTracker()
+	if t == nil {
+		return nil, true
+	}
+	now := time.Now()
+	t.mu.Lock()
+	rec := t.records[poolHealthKey(auth.ID)]
+	switch {
+	case !rec.blocked():
+		t.mu.Unlock()
+		return nil, true
+	case rec.RecheckAt.After(now) || rec.probing(now):
+		t.mu.Unlock()
+		return nil, false
+	}
+	t.probeSeq++
+	rec.probeToken = t.probeSeq
+	rec.probeUntil = now.Add(poolProbeTTL)
+	probe := &poolProbe{m: m, authID: auth.ID, token: rec.probeToken}
+	t.mu.Unlock()
+	m.restampPoolAuth(auth.ID)
+	return probe, true
+}
+
+// releasePoolProbe ends a recheck reservation that is still current. A
+// reservation already consumed by a recorded result is left alone.
+func (m *Manager) releasePoolProbe(authID string, token uint64) {
+	t := m.poolTracker()
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	rec := t.records[poolHealthKey(authID)]
+	if rec == nil || rec.probeToken != token {
+		t.mu.Unlock()
+		return
+	}
+	rec.clearProbe()
+	t.mu.Unlock()
+	m.restampPoolAuth(authID)
+}
+
+// restampPoolAuth re-evaluates pool state for one credential and refreshes the scheduler.
+func (m *Manager) restampPoolAuth(authID string) {
+	var snapshot *Auth
+	m.mu.Lock()
+	if auth := m.auths[authID]; auth != nil {
+		before := auth.pool
+		m.stampPoolLocked(auth)
+		if before != auth.pool {
+			auth.Generation++
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
 }
 
 func (m *Manager) setPoolRecheckForTest(authID string, at time.Time) {
