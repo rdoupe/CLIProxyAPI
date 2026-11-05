@@ -155,6 +155,9 @@ type Auth struct {
 
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
+	// pool is the account-pool decision (credit block, policy tier, paid
+	// exclusion) stamped by the Manager on every committed Auth.
+	pool poolAuthState
 	// fileSnapshotPath and fileSnapshotDigest bind an unversioned file-synthesized
 	// Auth snapshot to the source file path and SHA-256 byte digest it observed.
 	// Cleared when committed to a Manager so runtime clones are not treated as

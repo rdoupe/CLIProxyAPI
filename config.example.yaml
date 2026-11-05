@@ -200,6 +200,17 @@ routing:
   #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+  # Account pool policy: how login-based subscriptions and API keys are ordered.
+  # pool:
+  #   # "existing" (default): order by credential priority only.
+  #   # "subscriptions-first": try every subscription before any API key; priority
+  #   # still orders accounts inside each group. New subscriptions inherit this.
+  #   strategy: "existing"
+  #   # When false, API-key accounts are never used (subscriptions only). Default: true.
+  #   allow-paid-fallback: true
+  # An account that reports it is out of credits (for example Anthropic's
+  # "credit balance is too low") is skipped for every model and rechecked
+  # automatically after 1h, doubling up to 24h; see POOL_API.md.
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

@@ -412,10 +412,19 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
+	// routing.pool.allow-paid-fallback is pointer-backed: an explicit false turns
+	// paid API keys off and must be written, along with its parent mappings.
+	if len(path) > 0 && path[len(path)-1] == "allow-paid-fallback" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		return false
+	}
+
 	// A parent mapping carrying an explicit session-date-pin-days value must
 	// survive the zero-value check below, or the new key is never written.
 	if node != nil && node.Kind == yaml.MappingNode {
 		if pinIdx := findMapKeyIndex(node, "session-date-pin-days"); pinIdx >= 0 {
+			return false
+		}
+		if mappingContainsKey(node, "allow-paid-fallback") {
 			return false
 		}
 	}
@@ -456,6 +465,22 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		}
 	}
 
+	return false
+}
+
+// mappingContainsKey reports whether key appears anywhere in the mapping tree.
+func mappingContainsKey(node *yaml.Node, key string) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i] != nil && node.Content[i].Value == key {
+			return true
+		}
+		if mappingContainsKey(node.Content[i+1], key) {
+			return true
+		}
+	}
 	return false
 }
 

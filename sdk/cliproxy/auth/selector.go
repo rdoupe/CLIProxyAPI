@@ -362,7 +362,20 @@ func (e *modelCooldownError) Headers() http.Header {
 	return headers
 }
 
+// authPriority returns the effective selection priority. Under the
+// subscriptions-first pool policy the subscription tier dominates and the
+// configured priority only orders accounts inside each tier.
 func authPriority(auth *Auth) int {
+	base := authConfiguredPriority(auth)
+	if auth == nil || !auth.pool.tierActive {
+		return base
+	}
+	base = max(-poolPriorityClampAbs, min(poolPriorityClampAbs, base))
+	return auth.pool.tier*poolTierStride + base
+}
+
+// authConfiguredPriority returns the priority configured on the credential.
+func authConfiguredPriority(auth *Auth) int {
 	if auth == nil || auth.Attributes == nil {
 		return 0
 	}
@@ -828,6 +841,10 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	// An out-of-credits account is blocked for every model until its recheck.
+	if auth.pool.creditBlockActive(now) {
+		return true, blockReasonCooldown, auth.pool.recheckAt
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -975,6 +992,9 @@ func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time)
 		return true
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
+		return true
+	}
+	if auth.pool.creditBlockActive(now) {
 		return true
 	}
 	if hasUnauthorizedAuthFailure(auth) {

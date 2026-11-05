@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/poolstats"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
@@ -57,6 +58,10 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startModelCatalogUpdaters(ctx)
 
 	usage.StartDefault(ctx)
+	poolStats := poolstats.Register()
+	if s.coreManager != nil {
+		s.coreManager.SetPoolEventSink(poolStats)
+	}
 	cfg := s.currentConfig()
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {
@@ -66,6 +71,12 @@ func (s *Service) Run(ctx context.Context) error {
 		s.cfgMu.Unlock()
 		s.applyKVStoreConfig(cfg)
 		redisqueue.SetUsageStatisticsEnabled(true)
+		// The Home KV is shared by every node: keep this node's pool health and
+		// statistics in memory instead of overwriting other nodes' records.
+		poolStats.SetStore(poolstats.MemoryStore{})
+		if s.coreManager != nil {
+			s.coreManager.SetPoolHealthStore(coreauth.MemoryPoolHealthStore{})
+		}
 	}
 
 	defer func() {
@@ -96,6 +107,9 @@ func (s *Service) Run(ctx context.Context) error {
 			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
+		}
+		if errRestorePool := s.coreManager.RestorePoolHealth(ctx); errRestorePool != nil {
+			log.Warnf("failed to restore account pool health: %v", errRestorePool)
 		}
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 			includeBaseline: true,
@@ -392,6 +406,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		flushPoolStateBeforeKVShutdown(ctx, usage.DefaultManager(), s.coreManager, poolstats.Default())
 		if errShutdownKV := s.shutdownKVStore(); errShutdownKV != nil {
 			log.Errorf("failed to stop local kv store: %v", errShutdownKV)
 			if shutdownErr == nil {
@@ -400,9 +415,31 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
+		// Already drained above; kept so the dispatcher is stopped on every path.
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+// flushPoolStateBeforeKVShutdown drains the usage dispatcher, so every queued
+// usage record reaches the pool statistics collector, then persists pool
+// health and statistics. It must run while the KV store is still open.
+type usageDrainer interface {
+	StopAndDrain(ctx context.Context) error
+}
+
+func flushPoolStateBeforeKVShutdown(ctx context.Context, usageManager usageDrainer, manager *coreauth.Manager, stats *poolstats.Collector) {
+	if errDrain := usageManager.StopAndDrain(ctx); errDrain != nil {
+		log.Warnf("usage records were still queued at shutdown: %v", errDrain)
+	}
+	if manager != nil {
+		if errFlushPool := manager.FlushPoolHealth(ctx); errFlushPool != nil {
+			log.Warnf("failed to persist account pool health: %v", errFlushPool)
+		}
+	}
+	if errFlushStats := stats.Flush(ctx); errFlushStats != nil {
+		log.Warnf("failed to persist account pool statistics: %v", errFlushStats)
+	}
 }
 
 func (s *Service) ensureAuthDir() error {

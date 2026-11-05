@@ -146,6 +146,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
 	}
 	auth.ClearFileSnapshot()
+	m.stampPoolLocked(auth)
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.notifyAuthChangeLocked(auth.ID)
@@ -601,6 +602,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		auth.Generation = existing.Generation + 1
 	}
 	auth.ClearFileSnapshot()
+	m.stampPoolLocked(auth)
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.notifyAuthChangeLocked(auth.ID)
@@ -769,6 +771,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth.CredentialVersion == 0 {
 			auth.CredentialVersion = 1
 		}
+		m.stampPoolLocked(auth)
 		m.auths[auth.ID] = auth.Clone()
 	}
 

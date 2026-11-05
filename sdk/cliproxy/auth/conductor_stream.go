@@ -149,7 +149,10 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 	accessToken := authAccessTokenForRequest(ctx, auth, opts.Headers)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	streamStart := time.Now()
+	probe := poolProbeFromContext(ctx)
 	go func() {
+		// Runs after the stream's result is recorded.
+		defer probe.release()
 		defer close(out)
 		var failed bool
 		var sawCompleted bool
